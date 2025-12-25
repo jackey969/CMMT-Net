@@ -1,26 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-Semi-Supervised Training: UNet <-> DualFrequencyUNet Cross Pseudo Supervision (MC Dropout)
-+ RL-CutMix (applied on UNet only in this script)
+Semi-Supervised Training: Single MCNet2d (dual decoders) + Mean Teacher
++ Cross-head pseudo supervision + RL-CutMix (applied on head1)
++ MVAT (Mean-Teacher + Data-level MVAT)
 
-MODIFIED (as requested):
-(1) CPS -> Teacher-Student stopgrad + separate step
-    - Update UNet with:   loss_unet = sup_unet + lambda_u * unsup_unet_from_dfu + mix_loss
-      backward -> step(unet)
-    - Update DFUNet with: loss_dfu  = sup_dfu  + lambda_u * unsup_dfu_from_unet
-      backward -> step(dfu)
-    NOTE: pseudo labels are always generated with torch.no_grad() => teacher stopgrad.
-
-(2) Only stronger network acts as teacher (dynamic selection)
-    - If sup_loss_unet < sup_loss_dfu: UNet is teacher, DFUNet is student
-      => unsup_dfu_from_unet computed, unsup_unet_from_dfu = 0
-    - Else: DFUNet is teacher, UNet is student
-      => unsup_unet_from_dfu computed, unsup_dfu_from_unet = 0
-
-Other notes:
-- Kept your RL-CutMix agent update logic (optimizer_agent) unchanged.
-- Fixed a stability issue: pseudo_u_unet is only defined when Bu>0; RL labels_all now uses
-  pseudo from the current teacher (if unlabeled exists), else falls back to labeled only.
+Key changes:
+- Single model with two decoder heads (MCNet2d_v1) and an EMA mean teacher.
+- Cross-head mutual supervision: head1 supervised by teacher head2 pseudo labels and vice versa.
+- MVAT via VAT2d_v2_MT (mean-teacher) and VAT2d_v2_New_Data (data-level).
 """
 
 import argparse
@@ -40,10 +27,9 @@ from torchvision import transforms
 from tqdm import tqdm
 
 from dataloaders.dataset import BaseDataSets, RandomGenerator, TwoStreamBatchSampler
-from networks.unet import UNet
-from networks.DualFrequencyUNet import DualFrequencyUNet
+from networks.unet import MCNet2d_v1
 from utils import losses, util
-from utils.val_2D import test_single_volume
+from utils.val_2d import test_single_volume
 
 
 # ===================== 参数配置区 =====================
@@ -68,9 +54,14 @@ parser.add_argument("--load", default=False, action="store_true", help="restore 
 
 # 半监督参数
 parser.add_argument("--labeled_num", type=int, default=7, help="number of labeled patients")
-parser.add_argument("--mc_forward_times", type=int, default=8, help="MC Dropout forward passes")
 parser.add_argument("--lambda_u", type=float, default=1.0, help="unsup weight")
 parser.add_argument("--warmup_iters", type=int, default=5000, help="warmup iters for unsup weight")
+parser.add_argument("--ema_decay", type=float, default=0.99, help="EMA decay for mean teacher")
+parser.add_argument("--lambda_mvat_mt", type=float, default=0.1, help="MVAT mean-teacher loss weight")
+parser.add_argument("--lambda_mvat_data", type=float, default=0.1, help="MVAT data-level loss weight")
+parser.add_argument("--mvat_xi", type=float, default=10.0, help="MVAT xi")
+parser.add_argument("--mvat_eps", type=float, default=6.0, help="MVAT eps")
+parser.add_argument("--mvat_ip", type=int, default=1, help="MVAT iteration steps")
 
 # RL-CutMix 参数
 parser.add_argument("--rlcm_use", type=int, default=1, help="enable RL-CutMix if 1")
@@ -239,36 +230,10 @@ def random_bbox(B, H, W, scales, N):
     return bbox_list
 
 
-# ===================== MC Dropout（BN保持eval，仅Dropout随机） =====================
-def enable_dropout_only(model: nn.Module):
-    """Enable dropout layers during eval (keeps BN in eval)."""
-    for m in model.modules():
-        if isinstance(m, (nn.Dropout, nn.Dropout2d, nn.Dropout3d)):
-            m.train()
-
-
-def mc_dropout(model: nn.Module, x: torch.Tensor, mc_times: int):
-    """
-    Returns:
-        pseudo_label: (B,H,W)
-        mean_probs  : (B,C,H,W)
-    """
-    was_training = model.training
-    model.eval()
-    enable_dropout_only(model)
-
-    with torch.no_grad():
-        probs_list = []
-        for _ in range(mc_times):
-            logits = model(x)
-            probs = torch.softmax(logits, 1)
-            probs_list.append(probs)
-
-        mean_probs = torch.mean(torch.stack(probs_list, dim=0), dim=0)
-        pseudo_label = torch.argmax(mean_probs, dim=1)
-
-    model.train(was_training)
-    return pseudo_label, mean_probs
+@torch.no_grad()
+def update_ema_variables(model: nn.Module, ema_model: nn.Module, alpha: float):
+    for ema_param, param in zip(ema_model.parameters(), model.parameters()):
+        ema_param.data.mul_(alpha).add_(param.data, alpha=1 - alpha)
 
 
 # ===================== 训练主流程 =====================
@@ -305,12 +270,13 @@ def train(args, snapshot_path):
     )
     valloader = DataLoader(db_val, batch_size=1, shuffle=False, num_workers=0)
 
-    # 2) 两个模型
-    unet = UNet(in_chns=args.img_channels, class_num=args.num_classes).to(device)
-    dfunet = DualFrequencyUNet(in_chns=args.img_channels, class_num=args.num_classes).to(device)
+    # 2) 单模型 + Mean Teacher（双解码器）
+    model = MCNet2d_v1(in_chns=args.img_channels, class_num=args.num_classes).to(device)
+    ema_model = MCNet2d_v1(in_chns=args.img_channels, class_num=args.num_classes).to(device)
+    ema_model.load_state_dict(model.state_dict())
+    ema_model.eval()
 
-    optimizer_unet = optim.SGD(unet.parameters(), lr=args.base_lr, momentum=0.9, weight_decay=1e-4)
-    optimizer_dfunet = optim.SGD(dfunet.parameters(), lr=args.base_lr, momentum=0.9, weight_decay=1e-4)
+    optimizer_model = optim.SGD(model.parameters(), lr=args.base_lr, momentum=0.9, weight_decay=1e-4)
 
     dice_loss_batch = losses.DiceLoss(args.num_classes)
 
@@ -326,33 +292,30 @@ def train(args, snapshot_path):
     optimizer_agent = optim.Adam(agent.parameters(), lr=args.agent_lr)
     logging.info(f"[RL-CutMix] Enabled | Grid={N}x{N} | Scales={scales} | ent_coef={ent_coef} | rl_p={rl_prob} | override_p={override_prob}")
 
-    # 3) 可选：恢复 checkpoint（分别恢复）
+    # 3) 可选：恢复 checkpoint
     if args.load:
-        ckpt_unet = os.path.join(snapshot_path, f"{args.model}_unet_best_model.pth")
-        ckpt_dfu = os.path.join(snapshot_path, f"{args.model}_dfunet_best_model.pth")
-
-        if os.path.exists(ckpt_unet):
-            ckpt = torch.load(ckpt_unet, map_location=device)
-            unet.load_state_dict(ckpt["state_dict"] if isinstance(ckpt, dict) and "state_dict" in ckpt else ckpt, strict=False)
-            logging.info(f"Loaded UNet checkpoint: {ckpt_unet}")
+        ckpt_path = os.path.join(snapshot_path, f"{args.model}_best_model.pth")
+        if os.path.exists(ckpt_path):
+            ckpt = torch.load(ckpt_path, map_location=device)
+            model.load_state_dict(ckpt["state_dict"] if isinstance(ckpt, dict) and "state_dict" in ckpt else ckpt, strict=False)
+            ema_model.load_state_dict(model.state_dict())
+            logging.info(f"Loaded model checkpoint: {ckpt_path}")
         else:
-            logging.warning(f"UNet checkpoint not found: {ckpt_unet}")
+            logging.warning(f"Model checkpoint not found: {ckpt_path}")
 
-        if os.path.exists(ckpt_dfu):
-            ckpt = torch.load(ckpt_dfu, map_location=device)
-            dfunet.load_state_dict(ckpt["state_dict"] if isinstance(ckpt, dict) and "state_dict" in ckpt else ckpt, strict=False)
-            logging.info(f"Loaded DualFrequencyUNet checkpoint: {ckpt_dfu}")
-        else:
-            logging.warning(f"DualFrequencyUNet checkpoint not found: {ckpt_dfu}")
-
-    unet.train()
-    dfunet.train()
+    model.train()
     agent.train()
 
     max_epoch = args.max_iterations // len(trainloader) + 1
     iter_num = 0
-    best_performance_unet = 0.0
-    best_performance_dfu = 0.0
+    best_performance = 0.0
+
+    mvat_mt = losses.VAT2d_v2_MT(
+        xi=args.mvat_xi, epi=args.mvat_eps, ip=args.mvat_ip, num_classes=args.num_classes
+    )
+    mvat_data = losses.VAT2d_v2_New_Data(
+        xi=args.mvat_xi, epi=args.mvat_eps, ip=args.mvat_ip, num_classes=args.num_classes
+    )
 
     logging.info(f"Start training: {args.max_iterations} iterations, {len(trainloader)} iter/epoch")
     iterator = tqdm(range(max_epoch), ncols=80)
@@ -378,69 +341,53 @@ def train(args, snapshot_path):
                 lambda_u = args.lambda_u
 
             # =========================================================
-            # 1) 监督：标注部分 (两个网络都用 GT 监督)
+            # 1) 监督：标注部分 (双头都用 GT 监督)
             # =========================================================
-            logits_l_unet = unet(img_labeled)
-            probs_l_unet = torch.softmax(logits_l_unet, dim=1)
-            ce_sup_unet = F.cross_entropy(logits_l_unet, lbl_labeled.long(), reduction="mean")
-            dice_sup_unet = dice_loss_batch(probs_l_unet, lbl_labeled.unsqueeze(1))
-            sup_loss_unet = ce_sup_unet + dice_sup_unet
-
-            logits_l_dfu = dfunet(img_labeled)
-            probs_l_dfu = torch.softmax(logits_l_dfu, dim=1)
-            ce_sup_dfu = F.cross_entropy(logits_l_dfu, lbl_labeled.long(), reduction="mean")
-            dice_sup_dfu = dice_loss_batch(probs_l_dfu, lbl_labeled.unsqueeze(1))
-            sup_loss_dfu = ce_sup_dfu + dice_sup_dfu
+            logits_l_head1, logits_l_head2 = model(img_labeled)
+            probs_l_head1 = torch.softmax(logits_l_head1, dim=1)
+            probs_l_head2 = torch.softmax(logits_l_head2, dim=1)
+            ce_sup_head1 = F.cross_entropy(logits_l_head1, lbl_labeled.long(), reduction="mean")
+            ce_sup_head2 = F.cross_entropy(logits_l_head2, lbl_labeled.long(), reduction="mean")
+            dice_sup_head1 = dice_loss_batch(probs_l_head1, lbl_labeled.unsqueeze(1))
+            dice_sup_head2 = dice_loss_batch(probs_l_head2, lbl_labeled.unsqueeze(1))
+            sup_loss = ce_sup_head1 + dice_sup_head1 + ce_sup_head2 + dice_sup_head2
 
             # =========================================================
-            # 2) 动态选择 teacher（只让更强网络当 teacher）
-            #    sup_loss 更小 => 更强
+            # 2) 无标注：Mean Teacher + 跨头互监督
             # =========================================================
-            unet_is_teacher = bool(sup_loss_unet.item() < sup_loss_dfu.item())
-
-            # =========================================================
-            # 3) 无标注：仅 teacher -> student 的 CPS (stopgrad via no_grad)
-            #    + 分开 step：分别更新 UNet / DFUNet
-            # =========================================================
-            unsup_unet_from_dfu = torch.tensor(0.0, device=device)
-            unsup_dfu_from_unet = torch.tensor(0.0, device=device)
-
-            # 仅用于 RL labels_all 的伪标签（取当前 teacher 的 pseudo）
-            pseudo_u_teacher = None
+            unsup_loss = torch.tensor(0.0, device=device)
+            pseudo_u_head1 = None
+            pseudo_u_head2 = None
 
             if Bu > 0:
-                if unet_is_teacher:
-                    # teacher UNet -> student DFUNet
-                    pseudo_u_unet, _ = mc_dropout(unet, img_unlabeled, args.mc_forward_times)  # (Bu,H,W)
-                    pseudo_u_teacher = pseudo_u_unet
+                with torch.no_grad():
+                    ema_out1, ema_out2 = ema_model(img_unlabeled)
+                    ema_prob1 = torch.softmax(ema_out1, dim=1)
+                    ema_prob2 = torch.softmax(ema_out2, dim=1)
+                    pseudo_u_head1 = torch.argmax(ema_prob1, dim=1)
+                    pseudo_u_head2 = torch.argmax(ema_prob2, dim=1)
 
-                    logits_u_dfu = dfunet(img_unlabeled)
-                    probs_u_dfu = torch.softmax(logits_u_dfu, dim=1)
-                    ce_u_dfu = F.cross_entropy(logits_u_dfu, pseudo_u_unet.long(), reduction="mean")
-                    dice_u_dfu = dice_loss_batch(probs_u_dfu, pseudo_u_unet.unsqueeze(1))
-                    unsup_dfu_from_unet = ce_u_dfu + dice_u_dfu
-                else:
-                    # teacher DFUNet -> student UNet
-                    pseudo_u_dfu, _ = mc_dropout(dfunet, img_unlabeled, args.mc_forward_times)  # (Bu,H,W)
-                    pseudo_u_teacher = pseudo_u_dfu
+                logits_u_head1, logits_u_head2 = model(img_unlabeled)
+                probs_u_head1 = torch.softmax(logits_u_head1, dim=1)
+                probs_u_head2 = torch.softmax(logits_u_head2, dim=1)
 
-                    logits_u_unet = unet(img_unlabeled)
-                    probs_u_unet = torch.softmax(logits_u_unet, dim=1)
-                    ce_u_unet = F.cross_entropy(logits_u_unet, pseudo_u_dfu.long(), reduction="mean")
-                    dice_u_unet = dice_loss_batch(probs_u_unet, pseudo_u_dfu.unsqueeze(1))
-                    unsup_unet_from_dfu = ce_u_unet + dice_u_unet
+                ce_u_head1 = F.cross_entropy(logits_u_head1, pseudo_u_head2.long(), reduction="mean")
+                ce_u_head2 = F.cross_entropy(logits_u_head2, pseudo_u_head1.long(), reduction="mean")
+                dice_u_head1 = dice_loss_batch(probs_u_head1, pseudo_u_head2.unsqueeze(1))
+                dice_u_head2 = dice_loss_batch(probs_u_head2, pseudo_u_head1.unsqueeze(1))
+                unsup_loss = ce_u_head1 + dice_u_head1 + ce_u_head2 + dice_u_head2
 
             # =========================================================
-            # 4) RL-CutMix（仅 UNet，保持你原逻辑）
-            #    这里的 labels_all：labeled 使用 GT；unlabeled 使用当前 teacher 的 pseudo（若存在）
+            # 4) RL-CutMix（仅 head1）
+            #    labels_all：labeled 使用 GT；unlabeled 使用 EMA head1 的 pseudo（若存在）
             # =========================================================
             mix_loss = torch.tensor(0.0, device=device)
             loss_agent = torch.tensor(0.0, device=device)
 
             if rl_enabled and (random.random() < rl_prob):
                 # 若没有 unlabeled 或 pseudo 尚不可用，则只用 labeled 做 RL-CutMix
-                if Bu > 0 and pseudo_u_teacher is not None:
-                    labels_all = torch.cat([lbl_labeled, pseudo_u_teacher], dim=0)  # (B,H,W)
+                if Bu > 0 and pseudo_u_head1 is not None:
+                    labels_all = torch.cat([lbl_labeled, pseudo_u_head1], dim=0)  # (B,H,W)
                     imgs_all = torch.cat([img_labeled, img_unlabeled], dim=0)       # (B,C,H,W)
                 else:
                     labels_all = lbl_labeled
@@ -464,7 +411,7 @@ def train(args, snapshot_path):
 
                 mixed_images, mixed_labels = apply_cutmix(img_A, img_B, lbl_A, lbl_B, final_bbox)
 
-                logits_m = unet(mixed_images)
+                logits_m = model(mixed_images)[0]
                 probs_m = torch.softmax(logits_m, dim=1)
                 ce_m = F.cross_entropy(logits_m, mixed_labels.long(), reduction="mean")
                 dice_m = dice_loss_batch(probs_m, mixed_labels.unsqueeze(1))
@@ -501,120 +448,88 @@ def train(args, snapshot_path):
                 avg_area_ratio = 0.0
 
             # =========================================================
-            # 5) 分开 backward/step (Teacher-Student stopgrad + separate step)
-            #    - UNet: sup_unet + lambda_u*unsup_unet_from_dfu + mix_loss
-            #    - DFUNet: sup_dfu + lambda_u*unsup_dfu_from_unet
+            # 5) MVAT + 统一更新
             # =========================================================
-            # ---- update UNet ----
-            loss_unet = sup_loss_unet + lambda_u * unsup_unet_from_dfu + mix_loss
-            optimizer_unet.zero_grad(set_to_none=True)
-            loss_unet.backward()
-            optimizer_unet.step()
+            mvat_mt_loss = torch.tensor(0.0, device=device)
+            mvat_data_loss = torch.tensor(0.0, device=device)
+            if Bu > 0:
+                mvat_mt_loss = mvat_mt(model, ema_model, img_unlabeled)
+                mvat_data_loss = mvat_data(model, img_unlabeled)
 
-            # ---- update DFUNet ----
-            loss_dfu = sup_loss_dfu + lambda_u * unsup_dfu_from_unet
-            optimizer_dfunet.zero_grad(set_to_none=True)
-            loss_dfu.backward()
-            optimizer_dfunet.step()
+            total_loss = (
+                sup_loss
+                + lambda_u * unsup_loss
+                + args.lambda_mvat_mt * mvat_mt_loss
+                + args.lambda_mvat_data * mvat_data_loss
+                + mix_loss
+            )
+            optimizer_model.zero_grad(set_to_none=True)
+            total_loss.backward()
+            optimizer_model.step()
+            update_ema_variables(model, ema_model, args.ema_decay)
 
             # ---- update RL agent ----
-            optimizer_agent.zero_grad(set_to_none=True)
-            loss_agent.backward()
-            optimizer_agent.step()
+            if loss_agent.grad_fn is not None:
+                optimizer_agent.zero_grad(set_to_none=True)
+                loss_agent.backward()
+                optimizer_agent.step()
 
             # ====== 学习率衰减（Poly） ======
             lr_ = args.base_lr * (1.0 - iter_num / args.max_iterations) ** 0.9
-            for pg in optimizer_unet.param_groups:
-                pg["lr"] = lr_
-            for pg in optimizer_dfunet.param_groups:
+            for pg in optimizer_model.param_groups:
                 pg["lr"] = lr_
 
             iter_num += 1
 
             # ====== 日志 ======
-            total_loss = loss_unet.detach() + loss_dfu.detach()  # 仅用于监控（不是用于 backward 的总 loss）
-            sup_loss = sup_loss_unet.detach() + sup_loss_dfu.detach()
-            unsup_loss = unsup_unet_from_dfu.detach() + unsup_dfu_from_unet.detach()
-
-            teacher_name = "UNet" if unet_is_teacher else "DFUNet"
+            total_loss = total_loss.detach()
+            sup_loss = sup_loss.detach()
+            unsup_loss = unsup_loss.detach()
             logging.info(
                 f"[Iter {iter_num:05d}] "
-                f"T={teacher_name} "
-                f"loss(u={loss_unet.item():.4f}, d={loss_dfu.item():.4f}, sum={total_loss.item():.4f}) "
-                f"sup={sup_loss.item():.4f}(u={sup_loss_unet.item():.4f},d={sup_loss_dfu.item():.4f}) "
-                f"unsup={unsup_loss.item():.4f}(u<-d={unsup_unet_from_dfu.item():.4f},d<-u={unsup_dfu_from_unet.item():.4f}) "
+                f"loss={total_loss.item():.4f} "
+                f"sup={sup_loss.item():.4f} "
+                f"unsup={unsup_loss.item():.4f} "
+                f"mvat_mt={mvat_mt_loss.item():.4f} mvat_data={mvat_data_loss.item():.4f} "
                 f"mix={mix_loss.item():.4f} "
                 f"λu={lambda_u:.3f} lr={lr_:.2e} "
                 f"RL:R={raw_reward_mean:.3f} H={entropy_mean:.3f} s={avg_scale_idx:.2f} A={avg_area_ratio * 100:.1f}% O={override_ratio:.1f}%"
             )
 
-            # ===== 验证（分别评估两网并保存各自best）=====
+            # ===== 验证（评估两头并保存best）=====
             if iter_num % 200 == 0:
-                # ---- eval UNet ----
-                unet.eval()
-                metric_list = 0.0
+                model.eval()
+                metric_list_head1 = 0.0
+                metric_list_head2 = 0.0
                 for val_batch in valloader:
-                    metric_i = test_single_volume(
-                        val_batch["image"], val_batch["label"], unet, classes=args.num_classes
+                    metric_h1 = test_single_volume(
+                        val_batch["image"], val_batch["label"], model, classes=args.num_classes, head_index=0
                     )
-                    metric_list += np.array(metric_i)
-                metric_list = metric_list / len(db_val)
+                    metric_h2 = test_single_volume(
+                        val_batch["image"], val_batch["label"], model, classes=args.num_classes, head_index=1
+                    )
+                    metric_list_head1 += np.array(metric_h1)
+                    metric_list_head2 += np.array(metric_h2)
+                metric_list_head1 = metric_list_head1 / len(db_val)
+                metric_list_head2 = metric_list_head2 / len(db_val)
 
-                mean_dice = np.mean(metric_list, axis=0)[0]
-                mean_hd95 = np.mean(metric_list, axis=0)[1]
-                mean_jacc = np.mean(metric_list, axis=0)[2]
+                mean_dice_h1 = np.mean(metric_list_head1, axis=0)[0]
+                mean_dice_h2 = np.mean(metric_list_head2, axis=0)[0]
+                mean_dice = 0.5 * (mean_dice_h1 + mean_dice_h2)
 
-                if mean_dice > best_performance_unet:
-                    best_performance_unet = mean_dice
-                    save_best = os.path.join(snapshot_path, f"{args.model}_unet_best_model.pth")
-                    util.save_checkpoint(epoch_num, unet, optimizer_unet, torch.tensor(mean_dice), save_best)
-                    logging.info(f"[UNet] BEST @ iter {iter_num}: Dice={mean_dice:.4f}, HD95={mean_hd95:.4f}, Jacc={mean_jacc:.4f}")
-
-                for ci in range(args.num_classes - 1):
+                if mean_dice > best_performance:
+                    best_performance = mean_dice
+                    save_best = os.path.join(snapshot_path, f"{args.model}_best_model.pth")
+                    util.save_checkpoint(epoch_num, model, optimizer_model, torch.tensor(mean_dice), save_best)
                     logging.info(
-                        "[UNet] iter %d: val_%d_dice: %f  val_%d_hd95: %f  val_%d_jaccard: %f"
-                        % (iter_num, ci + 1, metric_list[ci, 0],
-                           ci + 1, metric_list[ci, 1],
-                           ci + 1, metric_list[ci, 2])
+                        f"[MCNet2d] BEST @ iter {iter_num}: Dice(h1={mean_dice_h1:.4f}, h2={mean_dice_h2:.4f})"
                     )
+
                 logging.info(
-                    "[UNet] iter %d : mean_dice: %f  mean_hd95: %f  mean_jaccard: %f"
-                    % (iter_num, mean_dice, mean_hd95, mean_jacc)
+                    "[MCNet2d] iter %d : mean_dice_h1: %f  mean_dice_h2: %f  mean_dice_avg: %f"
+                    % (iter_num, mean_dice_h1, mean_dice_h2, mean_dice)
                 )
-                unet.train()
-
-                # ---- eval DualFrequencyUNet ----
-                dfunet.eval()
-                metric_list = 0.0
-                for val_batch in valloader:
-                    metric_i = test_single_volume(
-                        val_batch["image"], val_batch["label"], dfunet, classes=args.num_classes
-                    )
-                    metric_list += np.array(metric_i)
-                metric_list = metric_list / len(db_val)
-
-                mean_dice = np.mean(metric_list, axis=0)[0]
-                mean_hd95 = np.mean(metric_list, axis=0)[1]
-                mean_jacc = np.mean(metric_list, axis=0)[2]
-
-                if mean_dice > best_performance_dfu:
-                    best_performance_dfu = mean_dice
-                    save_best = os.path.join(snapshot_path, f"{args.model}_dfunet_best_model.pth")
-                    util.save_checkpoint(epoch_num, dfunet, optimizer_dfunet, torch.tensor(mean_dice), save_best)
-                    logging.info(f"[DFUNet] BEST @ iter {iter_num}: Dice={mean_dice:.4f}, HD95={mean_hd95:.4f}, Jacc={mean_jacc:.4f}")
-
-                for ci in range(args.num_classes - 1):
-                    logging.info(
-                        "[DFUNet] iter %d: val_%d_dice: %f  val_%d_hd95: %f  val_%d_jaccard: %f"
-                        % (iter_num, ci + 1, metric_list[ci, 0],
-                           ci + 1, metric_list[ci, 1],
-                           ci + 1, metric_list[ci, 2])
-                    )
-                logging.info(
-                    "[DFUNet] iter %d : mean_dice: %f  mean_hd95: %f  mean_jaccard: %f"
-                    % (iter_num, mean_dice, mean_hd95, mean_jacc)
-                )
-                dfunet.train()
+                model.train()
 
             if iter_num >= args.max_iterations:
                 iterator.close()
