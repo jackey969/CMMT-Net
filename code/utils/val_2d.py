@@ -15,7 +15,7 @@ def calculate_metric_percase(pred, gt):
         return 0, 0
 
 
-def test_single_volume(image, label, model, classes, patch_size=[256, 256]):
+def test_single_volume(image, label, model, classes, patch_size=[256, 256], head_index=0):
     image, label = image.squeeze(0).cpu().detach(
     ).numpy(), label.squeeze(0).cpu().detach().numpy()
     prediction = np.zeros_like(label)
@@ -27,8 +27,8 @@ def test_single_volume(image, label, model, classes, patch_size=[256, 256]):
         model.eval()
         with torch.no_grad():
             output = model(input)
-            if len(output)>1:
-                output = output[0]
+            if isinstance(output, (tuple, list)):
+                output = output[head_index]
             out = torch.argmax(torch.softmax(output, dim=1), dim=1).squeeze(0)
             out = out.cpu().detach().numpy()
             pred = zoom(out, (x / patch_size[0], y / patch_size[1]), order=0)
